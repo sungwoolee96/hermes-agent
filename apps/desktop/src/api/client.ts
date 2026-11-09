@@ -834,10 +834,24 @@ export interface SessionReadOwnerRoute {
 
 export type SessionOwnerResolver = (sessionId: string) => SessionReadOwnerRoute | null | string | undefined
 
-let _sessionOwnerResolver: SessionOwnerResolver | null = null
+export interface SessionDownloadOwner {
+  owner: ReturnType<SessionOwnerResolver>
+  sessionId: string
+}
 
-export function setSessionOwnerResolver(resolver: SessionOwnerResolver | null): void {
+let _sessionOwnerResolver: SessionOwnerResolver | null = null
+let _sessionDownloadOwnerResolver: ((id: string) => SessionDownloadOwner) | null = null
+
+export function setSessionOwnerResolver(
+  resolver: SessionOwnerResolver | null,
+  downloadResolver: ((id: string) => SessionDownloadOwner) | null = null
+): void {
   _sessionOwnerResolver = resolver
+  _sessionDownloadOwnerResolver = downloadResolver
+}
+
+export function sessionDownloadOwner(id: string): SessionDownloadOwner {
+  return _sessionDownloadOwnerResolver?.(id) ?? { owner: _sessionOwnerResolver?.(id), sessionId: id }
 }
 
 /** The connection pin a session-scoped READ must carry for `id`, or {} when
@@ -875,8 +889,9 @@ export function sessionReadOwnerPin(id: string, profile?: ProfileScope): { conne
  *  backend-facing profile, plus its connection when that is not the ambient one.
  *  Null when no owner profile is known. A file route looks `session_id` up in
  *  the profile the request names, so the id must never travel with another
- *  profile: a caller that gets null names no session at all. */
-export function sessionFileOwnerScope(id: string): { connectionId?: string; profile: string } | null {
+ *  profile: a caller that gets null names no session at all. Saves can retain
+ *  the ambient connection pin too, since a native dialog may outlive a switch. */
+export function sessionFileOwnerScope(id: string, pinAmbient = false): { connectionId?: string; profile: string } | null {
   const owner = _sessionOwnerResolver?.(id)
 
   if (!owner) {
@@ -897,5 +912,7 @@ export function sessionFileOwnerScope(id: string): { connectionId?: string; prof
 
   const connectionId = String(owner.connectionId ?? '').trim()
 
-  return connectionId && connectionId !== (ambientOwnerConnectionId() ?? 'local') ? { connectionId, profile } : { profile }
+  return connectionId && (pinAmbient || connectionId !== (ambientOwnerConnectionId() ?? 'local'))
+    ? { connectionId, profile }
+    : { profile }
 }

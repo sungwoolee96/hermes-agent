@@ -5,8 +5,10 @@ import type { HermesConnection } from '@/global'
 import { I18nProvider } from '@/i18n'
 import { createBrowserFilesBridge } from '@/lib/browser-files'
 import type { BrowserBootstrap } from '@/lib/browser-transport'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $notifications } from '@/store/notifications'
 import { $activeSessionId, $connection, $selectedStoredSessionId, $sessions } from '@/store/session'
+import { clearAllSessionStates, publishSessionState, recordSessionEventScope } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import { GeneratedImage } from './generated-image-result'
@@ -33,6 +35,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  clearAllSessionStates()
   vi.clearAllMocks()
   $connection.set(null)
   $sessions.set([])
@@ -84,7 +87,7 @@ it.each([
     profile: 'default',
     token: 'secret-token'
   } as unknown as HermesConnection)
-  $sessions.set([{ id: 'origin-session', profile: 'work' } as SessionInfo])
+  $sessions.set([{ id: 'origin-session', profile: 'work', connection_id: 'remote-1' } as SessionInfo])
   $selectedStoredSessionId.set('origin-session')
 
   const link = openImageLink(image)
@@ -94,7 +97,7 @@ it.each([
 
   await vi.waitFor(() =>
     expect(saveGatewayFile).toHaveBeenCalledWith(
-      expect.objectContaining({ connectionId: 'remote-1', path: image, suggestedName: name })
+      expect.objectContaining({ connectionId: 'remote-1', path: image, profile: 'work', sessionId: 'origin-session', suggestedName: name })
     )
   )
   await expect(saveGatewayFile.mock.results[0]!.value).resolves.toEqual({ path: saved, saved: true })
@@ -102,8 +105,26 @@ it.each([
   expect(openExternal).not.toHaveBeenCalled()
 })
 
-// A chat with no stored id yet names its live runtime session, as the chat's other file opens do.
-it('saves a relative gateway image from a chat not stored yet through its runtime session', async () => {
+it('keeps the stored image owner when a different runtime and foreground profile are present', async () => {
+  saveGatewayFile.mockResolvedValue({ saved: true })
+  $connection.set({ connectionId: 'remote-1', mode: 'remote', profile: 'default' } as HermesConnection)
+  $sessions.set([{ id: 'origin-session', profile: 'work', connection_id: 'remote-1' } as SessionInfo])
+  $selectedStoredSessionId.set('origin-session')
+  $activeSessionId.set('unrelated-runtime')
+
+  const link = openImageLink('/srv/project/cat.png')
+
+  await act(async () => {
+    fireEvent.click(link)
+  })
+
+  await vi.waitFor(() => expect(saveGatewayFile).toHaveBeenCalledWith(expect.objectContaining({
+    connectionId: 'remote-1', profile: 'work', sessionId: 'origin-session', path: '/srv/project/cat.png'
+  })))
+  expect($notifications.get().map(({ title }) => title)).not.toContain('Image download failed')
+})
+
+it('saves a relative gateway image through the stored identity bound to its runtime', async () => {
   saveGatewayFile.mockResolvedValue({ path: '/srv/project/renders/out.png', saved: true })
   window.document.documentElement.dataset.hermesDesktopHost = 'browser'
   $connection.set({
@@ -113,6 +134,8 @@ it('saves a relative gateway image from a chat not stored yet through its runtim
     token: 'secret-token'
   } as unknown as HermesConnection)
   $activeSessionId.set('runtime-1')
+  publishSessionState('runtime-1', createClientSessionState('origin-session'))
+  recordSessionEventScope({ session_id: 'runtime-1', profile: 'work', connectionId: 'remote-1' })
 
   const link = openImageLink('renders/out.png')
   await act(async () => {
@@ -122,7 +145,7 @@ it('saves a relative gateway image from a chat not stored yet through its runtim
   await vi.waitFor(
     () =>
       expect(saveGatewayFile).toHaveBeenCalledWith(
-        expect.objectContaining({ path: 'renders/out.png', sessionId: 'runtime-1' })
+        expect.objectContaining({ path: 'renders/out.png', profile: 'work', sessionId: 'origin-session' })
       ),
     { timeout: 2000 }
   )

@@ -69,6 +69,7 @@ import {
   $workspaceCwdOwner,
   clearReadBaseline,
   getSessionOwnerHint,
+  getSessionOwnerHints,
   knownSessionOwner,
   lineageAliases,
   markSessionRead,
@@ -84,6 +85,7 @@ import {
   setTurnStartedAt
 } from './session'
 import { secondaryProfileOwnerForEvent } from './session-event-provenance'
+import { durableDownloadOwner, resolveSessionFileDownloadOwner } from './session-file-download-owner'
 import { $focusedStoredSessionId, TILE_PANE_PREFIX } from './session-focus'
 import { turnHasReply, withNoReplyNotice } from './session-no-reply'
 import { assertSessionOwnerResolved } from './session-owner-resolution'
@@ -1737,33 +1739,9 @@ export function openTileGatewayScopes(): Set<string> {
   return scopes
 }
 
-/**
- * Sync owner resolution for a session id that may be a RUNTIME or a STORED id.
- * Tile route first (exact connectionId+profile, survives relaunch), then the
- * exact unique owner hint (stamped when a routed create returns / at open
- * time; persisted), then the session row's owner (an exact route when the row
- * is connection-tagged, else its bare profile, else the hint's profile). The
- * row rung searches every source-scoped slice (recents, cron, messaging), not
- * just recents — a cron session's approval.respond used to find no owner here
- * and fail closed on registry-topology installs even though its row (with its
- * `profile` stamp) was already loaded for the sidebar's cron section. The
- * hint outranks the row for the same reason as contrib/wiring's ladder: a
- * row can be stamped from the ambient profile and carries no connection.
- * Last rung: the owner recorded from the inbound runtime event itself
- * (sessionOwnerByRuntimeId, #97511) — an orphan runtime whose tile/hint/row
- * binding is absent or stale still routes through the exact
- * (connectionId, profile) or secondary socket's proven local profile. It sits
- * BELOW every durable EXACT route, so a stored-id collision never inherits a
- * stale runtime ledger entry, but it must sit ABOVE a bare profile name: a
- * bare profile carries no connection, and the profile door resolves it against
- * the PRIMARY connection (store/gateway gatewayForProfile), which for an
- * ordinary session that runs on a non-primary connection — two connections
- * both exposing `default` is enough — is another machine that answers
- * `4001 session not found`. Unproven profile fields record nothing, so unknown
- * owners in multi-profile topology still fail closed.
- * Returns undefined when no owner is known — the caller fails closed
- * (assertSessionOwnerResolved), never falls to "active".
- */
+/** RPC/read owner ladder: durable exact tile → hint → row, then event owner,
+ * then durable profile-only evidence. Unknown ownership never means "active".
+ * Runtime ids are translated for RPCs; downloads use a separate durable-id policy. */
 export function knownOwnerForSession(sessionId: null | string | undefined, rows = ownerLookupSessionRows()) {
   if (!sessionId) {
     return undefined
@@ -1783,9 +1761,21 @@ export function knownOwnerForSession(sessionId: null | string | undefined, rows 
   return sessionOwnerByRuntimeId.get(sessionId) ?? durable
 }
 
-// Session-scoped REST reads (detail / messages / timeline) resolve their
-// connection pin through the SAME owner ladder as RPC dispatch (#125372).
-setSessionOwnerResolver(knownOwnerForSession)
+// RPC/REST reads retain their ladder; downloads additionally bind durable identity.
+setSessionOwnerResolver(knownOwnerForSession, id => {
+  const rows = ownerLookupSessionRows()
+
+  return resolveSessionFileDownloadOwner(id, {
+    durableOwner: stored => durableDownloadOwner([sessionTileOwner(stored), getSessionOwnerHint(stored), knownSessionOwner(rows, stored)]),
+    hasStoredId: stored => $sessionTiles.get().some(tile => tile.storedSessionId === stored) ||
+      getSessionOwnerHints(stored).length > 0 || rows.some(row => sessionMatchesStoredId(row, stored)),
+    isRuntime: runtime => runtime === $activeSessionId.get() || runtime in $sessionStates.get() || sessionOwnerByRuntimeId.has(runtime) ||
+      $sessionTiles.get().some(tile => tile.runtimeId === runtime),
+    runtimeOwner: runtimeSessionOwner,
+    storedId: runtime => $sessionTiles.get().find(tile => tile.runtimeId === runtime)?.storedSessionId ??
+      $sessionStates.get()[runtime]?.storedSessionId ?? null
+  })
+})
 
 /** The profile whose chat is on screen — the rail's scope.
  *

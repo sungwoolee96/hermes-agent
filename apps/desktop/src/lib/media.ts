@@ -1,6 +1,6 @@
 import { fileUrlToNativePath, LOCAL_CONNECTION_ID } from '@hermes/shared'
 
-import { capabilityScoped, hermesApi, type OwnerScope, sessionFileOwnerScope } from '@/api/client'
+import { capabilityScoped, hermesApi, type OwnerScope, sessionDownloadOwner, sessionFileOwnerScope, type SessionReadOwnerRoute } from '@/api/client'
 import type { HermesConnection } from '@/global'
 import { translateNow } from '@/i18n'
 import { desktopFsCacheKey, isReadFileErrorResult, readDesktopFileDataUrl } from '@/lib/desktop-fs'
@@ -422,13 +422,41 @@ export async function downloadGatewayMediaFile(
   }
 
   const conn = $connection.get()
-  const owner = origin.owner ?? { connectionId: conn?.connectionId, profile: origin.profile ?? conn?.profile }
+  const resolved = origin.sessionId ? sessionDownloadOwner(origin.sessionId) : null
+  const known = resolved?.owner
+  const route: SessionReadOwnerRoute | null | undefined = typeof known === 'string' ? { profile: known } : known
+  const profile = route?.targetProfile || route?.profile
+  const aliases = [route?.profile, route?.targetProfile].filter(Boolean)
+  const explicitProfiles = [origin.owner?.profile, origin.profile].filter(Boolean)
+
+  // Validate aliases only against proven ownership, never against the window.
+  if (
+    (route && explicitProfiles.some(name => !aliases.includes(name))) ||
+    (!route && explicitProfiles.length === 2 && explicitProfiles[0] !== explicitProfiles[1]) ||
+    (origin.owner?.connectionId && route?.connectionId && origin.owner.connectionId !== route.connectionId)
+  ) {
+    throw new Error('Gateway file session does not belong to the requested owner')
+  }
+
+  if (origin.sessionId && !profile && !explicitProfiles.length) {
+    throw new Error('Gateway file session owner is unknown')
+  }
+
+  // An explicit route is atomic: an omitted pin means the legacy profile pool.
+  // Unknown/unlisted stored artifacts may retain their explicitly supplied owner.
+  const owner = origin.owner
+    ? { ...origin.owner, profile: profile || origin.owner.profile || origin.profile }
+    : route
+      ? { connectionId: route.connectionId, profile }
+      : origin.profile
+        ? { profile: origin.profile }
+        : { connectionId: conn?.connectionId, profile: conn?.profile }
 
   return window.hermesDesktop.saveGatewayFile({
     ...(owner.connectionId ? { connectionId: owner.connectionId } : {}),
     path,
     ...(owner.profile ? { profile: owner.profile } : {}),
-    ...(origin.sessionId ? { sessionId: origin.sessionId } : {}),
+    ...(resolved ? { sessionId: resolved.sessionId } : {}),
     suggestedName:
       origin.suggestedName ||
       mediaName(path).replace(/(?:%[0-9a-f]{2})+/gi, encoded => {

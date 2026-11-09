@@ -103,7 +103,11 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
           if (/^data:/i.test(image)) {
             void download()
           } else if (isRemoteGateway() && isFileMediaPath(image)) {
-            void downloadGatewayMediaFile(image).catch(error => notifyError(error, copy.imageDownloadFailed))
+            const origin = storedSessionId || runtimeId ? sessionFileOrigin(storedSessionId, runtimeId) : Promise.resolve({})
+
+            void origin
+              .then(scope => downloadGatewayMediaFile(image, scope))
+              .catch(error => notifyError(error, copy.imageDownloadFailed))
           } else if (isRemoteGateway() && !isInlineMediaSrc(image)) {
             void sessionFileOrigin(storedSessionId, runtimeId)
               .then(origin => downloadGatewayMediaFile(image, origin))
