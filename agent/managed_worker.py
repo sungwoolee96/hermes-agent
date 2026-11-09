@@ -1,8 +1,10 @@
 """Private exec entry. No agent/config imports before adopted process authority.
 
-stdin is the owner's bounded bootstrap/control pipe; a duplicate of stdout is
-reserved for framed events before runtime imports redirect ordinary output.
-Neither assignment secrets nor launch credentials appear in argv or logs.
+stdin is the owner's bounded bootstrap/control pipe; it moves to a private
+descriptor before the first read and fd 0 becomes the null device. A duplicate
+of stdout is reserved for framed events before runtime imports redirect
+ordinary output. Neither assignment secrets nor launch credentials appear in
+argv or logs.
 """
 # Spawned as a bare ``sys.executable -m``: in a PM install that interpreter carries no dependencies
 # until hermes_bootstrap selects the committed environment, so it must be the first import.
@@ -85,6 +87,39 @@ def accept_result(result):
     usage['total_tokens'] = usage['input_tokens'] + usage['output_tokens']
     accepted.update(input_tokens=incoming or 0, output_tokens=outgoing or 0)
     return accepted, usage
+
+
+def take_control_pipe():
+    """The owner's control pipe as a private stream; fd 0 becomes the null device.
+
+    On Windows a control reader blocked in the CRT ``read`` on fd 0 deadlocked a native DLL that
+    touched that descriptor while loading (numpy's OpenBLAS under the holographic provider: the
+    first turn never started), and a child inheriting the pipe as stdin (``git --version`` in the
+    version stamp) stalled until its timeout. Nothing but this worker's control reader may hold
+    the pipe. The one buffered object reads the bootstrap AND every later control frame, so a
+    frame the owner wrote right behind the bootstrap is never stranded in another buffer.
+    """
+    control = os.fdopen(os.dup(sys.stdin.fileno()), 'rb')  # non-inheritable (PEP 446)
+    null = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(null, sys.stdin.fileno())
+    finally:
+        os.close(null)
+    return control
+
+
+def warm_memory_provider_import(policy):
+    """Windows: import the frozen ``memory.provider`` module and numpy on the main thread before the
+    control reader starts (the ACP startup warm-up, #58083), so their first native load never races
+    another thread. A session that skips memory imports nothing; a failed warm-up is left to agent
+    init, which reports the provider failure as before."""
+    if sys.platform != 'win32' or policy.ignore_rules:
+        return
+    try:
+        from plugins.memory import import_memory_provider_module
+        import_memory_provider_module()
+    except Exception:
+        logger.debug('memory provider warm-up skipped', exc_info=True)
 
 
 def read_frame(stream):
@@ -175,8 +210,9 @@ def _die_with_owner():
 
 
 class WorkerControls:
-    def __init__(self, channel, route):
+    def __init__(self, channel, route, control=None):
         self.channel, self.route = channel, route
+        self.control = control if control is not None else sys.stdin.buffer
         self.agent = None
         self.stopped = threading.Event()
         self.finish = threading.Event()
@@ -199,7 +235,7 @@ class WorkerControls:
         from tools.approval import resolve_gateway_approval
         try:
             while True:
-                frame = read_frame(sys.stdin.buffer)
+                frame = read_frame(self.control)
                 if frame == {'type': 'stop'}:
                     self.stop()
                     continue
@@ -327,7 +363,7 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
-def execute(frame, channel):
+def execute(frame, channel, control=None):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
@@ -348,6 +384,7 @@ def execute(frame, channel):
     from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks
     policy = restore_policy(frame['policy'])
     register_worker_hooks(policy)
+    warm_memory_provider_import(policy)
     discover_profile_mcp(policy)
     from run_agent import AIAgent
     from tools.approval import register_gateway_notify, unregister_gateway_notify
@@ -356,7 +393,7 @@ def execute(frame, channel):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
-    controls = WorkerControls(channel, frame['route'])
+    controls = WorkerControls(channel, frame['route'], control)
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     try:
@@ -450,6 +487,7 @@ def hello():
 
 
 def main():
+    control = take_control_pipe()
     channel = WorkerChannel(os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0))  # windows-footgun: ok — binary frames
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     # This process's own stderr only, never the channel. The owner drains it into the profile's
@@ -460,8 +498,8 @@ def main():
     logger.propagate = False
     try:
         channel.send('hello', **hello())
-        frame = validate_bootstrap(read_frame(sys.stdin.buffer))
-        execute(frame, channel)
+        frame = validate_bootstrap(read_frame(control))
+        execute(frame, channel, control)
     except Exception:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')
